@@ -20,6 +20,8 @@ class TripStore(Protocol):
 class SupabaseStore:
     """Talks to the `trips` table through Supabase's REST API using the service key."""
 
+    RETRIES = 2  # extra attempts for idempotent requests on network errors
+
     def __init__(self, url: str, key: str):
         self.endpoint = f"{url}/rest/v1/trips"
         self.headers = {
@@ -28,10 +30,20 @@ class SupabaseStore:
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }
+        # One pooled client: reusing the TLS connection is much faster on slow links.
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(30, connect=15))
 
     async def _req(self, method: str, params: dict | None = None, body: dict | None = None) -> list[dict]:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.request(method, self.endpoint, headers=self.headers, params=params, json=body)
+        # POST is not retried: if the first insert landed, a retry would hit a duplicate id.
+        attempts = 1 if method == "POST" else 1 + self.RETRIES
+        for attempt in range(attempts):
+            try:
+                resp = await self.client.request(method, self.endpoint, headers=self.headers, params=params, json=body)
+                break
+            except httpx.TransportError:
+                if attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
         resp.raise_for_status()
         return resp.json() if resp.content else []
 
